@@ -1,91 +1,223 @@
 import hashlib
 import json
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 from datetime import datetime
 import requests
+from dataclasses import dataclass
+from enum import Enum
+import pandas as pd
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from retry import retry
+
+# Enhanced data structures
+class ParasiteStatus(Enum):
+    ACTIVE = "Active"
+    ARCHIVED = "Archived"
+    UPDATED = "Updated"
+
+@dataclass
+class ParasiteRecord:
+    parasite_name: str
+    classification: str
+    location: str
+    metadata: Dict[str, Any]
+    researcher: str
+    institution: str
+    status: ParasiteStatus = ParasiteStatus.ACTIVE
+    version: int = 1
+    previous_version: Optional[int] = None
 
 class ParasiteDataPipeline:
-    def __init__(self, stacks_api_url: str):
+    def __init__(self, stacks_api_url: str, ipfs_gateway: str):
         self.stacks_api_url = stacks_api_url
+        self.ipfs_gateway = ipfs_gateway
         self.contract_address = "ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM"
-        self.contract_name = "parasite-registry"
-
-    def prepare_parasite_data(self, 
-                            parasite_name: str,
-                            classification: str,
-                            location: str,
-                            additional_metadata: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Prepare parasite data for blockchain storage
-        """
-        # Create complete metadata
-        metadata = {
-            "parasite_name": parasite_name,
-            "classification": classification,
-            "location": location,
-            "timestamp": datetime.utcnow().isoformat(),
-            "additional_data": additional_metadata
-        }
+        self.contract_name = "parasite-registry-v2"
         
-        # Generate metadata hash
-        metadata_hash = hashlib.sha256(
-            json.dumps(metadata, sort_keys=True).encode()
-        ).hexdigest()
+        # Setup logging
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
         
-        return {
-            "metadata": metadata,
-            "metadata_hash": metadata_hash
-        }
+        # Initialize cache
+        self.cache = {}
 
-    def submit_to_blockchain(self, prepared_data: Dict[str, Any]) -> str:
+    @retry(tries=3, delay=1)
+    async def prepare_parasite_data(self, 
+                                  record: ParasiteRecord,
+                                  additional_files: Optional[List[str]] = None) -> Dict[str, Any]:
         """
-        Submit prepared data to the Stacks blockchain
+        Enhanced data preparation with IPFS support and validation
         """
-        contract_call = {
-            "contract_address": self.contract_address,
-            "contract_name": self.contract_name,
-            "function_name": "add-parasite-record",
-            "function_args": [
-                prepared_data["metadata"]["parasite_name"],
-                prepared_data["metadata"]["classification"],
-                prepared_data["metadata"]["location"],
-                prepared_data["metadata_hash"]
-            ]
-        }
+        try:
+            # Validate input data
+            self._validate_record(record)
+            
+            # Process additional files if provided
+            ipfs_hashes = []
+            if additional_files:
+                ipfs_hashes = await self._process_additional_files(additional_files)
+            
+            # Create complete metadata
+            metadata = {
+                "parasite_name": record.parasite_name,
+                "classification": record.classification,
+                "location": record.location,
+                "timestamp": datetime.utcnow().isoformat(),
+                "researcher": record.researcher,
+                "institution": record.institution,
+                "version": record.version,
+                "additional_data": record.metadata,
+                "ipfs_files": ipfs_hashes
+            }
+            
+            # Generate metadata hash
+            metadata_hash = hashlib.sha256(
+                json.dumps(metadata, sort_keys=True).encode()
+            ).hexdigest()
+            
+            return {
+                "metadata": metadata,
+                "metadata_hash": metadata_hash
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error preparing parasite data: {str(e)}")
+            raise
+
+    async def submit_to_blockchain(self, 
+                                 prepared_data: Dict[str, Any],
+                                 update_existing: Optional[int] = None) -> str:
+        """
+        Enhanced blockchain submission with version control
+        """
+        try:
+            function_name = "update-parasite-record" if update_existing else "add-parasite-record"
+            
+            contract_call = {
+                "contract_address": self.contract_address,
+                "contract_name": self.contract_name,
+                "function_name": function_name,
+                "function_args": [
+                    prepared_data["metadata"]["parasite_name"],
+                    prepared_data["metadata"]["classification"],
+                    prepared_data["metadata"]["location"],
+                    prepared_data["metadata_hash"]
+                ]
+            }
+            
+            if update_existing:
+                contract_call["function_args"].insert(0, update_existing)
+            
+            # Submit to blockchain (implementation would use actual Stacks API)
+            return f"Transaction submitted with metadata hash: {prepared_data['metadata_hash']}"
+            
+        except Exception as e:
+            self.logger.error(f"Error submitting to blockchain: {str(e)}")
+            raise
+
+    async def analyze_geographic_distribution(self) -> pd.DataFrame:
+        """
+        New: Analyze geographic distribution of parasites
+        """
+        try:
+            # Fetch all records (implementation would use actual blockchain data)
+            records = await self._fetch_all_records()
+            
+            # Create DataFrame for analysis
+            df = pd.DataFrame(records)
+            
+            # Analyze geographic distribution
+            distribution = df.groupby('location').agg({
+                'record_id': 'count',
+                'classification': lambda x: list(set(x)),
+                'date_recorded': 'max'
+            }).reset_index()
+            
+            return distribution
+            
+        except Exception as e:
+            self.logger.error(f"Error analyzing geographic distribution: {str(e)}")
+            raise
+
+    async def get_record_history(self, record_id: int) -> List[Dict[str, Any]]:
+        """
+        New: Fetch complete history of a record
+        """
+        try:
+            history = []
+            current_id = record_id
+            
+            while current_id:
+                record = await self._fetch_record(current_id)
+                history.append(record)
+                current_id = record.get('previous_version')
+            
+            return history
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching record history: {str(e)}")
+            raise
+
+    def _validate_record(self, record: ParasiteRecord) -> None:
+        """
+        Validate parasite record data
+        """
+        if not record.parasite_name or not record.classification or not record.location:
+            raise ValueError("Missing required fields in parasite record")
         
-        # Note: In a real implementation, this would use the Stacks API
-        # to submit the contract call transaction
-        return f"Transaction submitted with metadata hash: {prepared_data['metadata_hash']}"
+        if not isinstance(record.metadata, dict):
+            raise ValueError("Metadata must be a dictionary")
 
-    def verify_record(self, record_id: int) -> Dict[str, Any]:
+    async def _process_additional_files(self, files: List[str]) -> List[str]:
         """
-        Verify a parasite record on the blockchain
+        Process and upload additional files to IPFS
         """
-        # In real implementation, this would query the Stacks blockchain
-        # to retrieve and verify the record
-        response = {
-            "verified": True,
-            "record_id": record_id,
-            "blockchain_timestamp": datetime.utcnow().isoformat()
-        }
-        return response
+        with ThreadPoolExecutor() as executor:
+            ipfs_hashes = list(executor.map(self._upload_to_ipfs, files))
+        return ipfs_hashes
+
+    def _upload_to_ipfs(self, file_path: str) -> str:
+        """
+        Upload file to IPFS (mock implementation)
+        """
+        return f"ipfs_hash_{hashlib.md5(file_path.encode()).hexdigest()}"
 
 # Example usage
-if __name__ == "__main__":
-    pipeline = ParasiteDataPipeline("https://stacks-node-api.mainnet.stacks.co")
+async def main():
+    pipeline = ParasiteDataPipeline(
+        "https://stacks-node-api.mainnet.stacks.co",
+        "https://ipfs.io"
+    )
     
-    # Example data
-    sample_data = pipeline.prepare_parasite_data(
+    # Create sample record
+    record = ParasiteRecord(
         parasite_name="Plasmodium falciparum",
         classification="Apicomplexan",
         location="Sub-Saharan Africa",
-        additional_metadata={
+        metadata={
             "resistance_profile": "chloroquine-resistant",
             "prevalence": "high",
-            "year_identified": 2024
-        }
+            "year_identified": 2024,
+            "genome_sequence": "ATCG...",
+            "treatment_protocols": ["artemisinin-based", "combination therapy"]
+        },
+        researcher="DR_SMITH",
+        institution="WHO_AFRICA"
     )
     
-    # Submit to blockchain
-    result = pipeline.submit_to_blockchain(sample_data)
-    print(result)
+    # Prepare and submit data
+    prepared_data = await pipeline.prepare_parasite_data(record, ["genome_data.fastq"])
+    result = await pipeline.submit_to_blockchain(prepared_data)
+    
+    # Analyze geographic distribution
+    distribution = await pipeline.analyze_geographic_distribution()
+    print(f"Geographic Distribution:\n{distribution}")
+    
+    # Get record history
+    history = await pipeline.get_record_history(1)
+    print(f"Record History:\n{json.dumps(history, indent=2)}")
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
